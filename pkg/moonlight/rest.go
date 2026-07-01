@@ -41,6 +41,13 @@ type RESTServerOptions struct {
 	Port       int
 	SecurePort int
 	Cert       tls.Certificate
+
+	// LaunchTimeout is how long /launch will wait for the operator to create a
+	// session and populate its stream URL before giving up. A cold start (image
+	// pull, wolf boot, wolf-agent readiness) can take longer than the default,
+	// so this is exposed as a knob instead of hard-coded. Defaults to 60s if
+	// unset.
+	LaunchTimeout time.Duration
 }
 
 type RESTServer struct {
@@ -70,6 +77,10 @@ func NewRESTServer(
 	sessionClient v1alpha1client.SessionInterface,
 	opts RESTServerOptions,
 ) *RESTServer {
+	if opts.LaunchTimeout <= 0 {
+		opts.LaunchTimeout = 60 * time.Second
+	}
+
 	ps := &RESTServer{
 		router:            http.NewServeMux(),
 		secureRouter:      http.NewServeMux(),
