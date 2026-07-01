@@ -109,21 +109,21 @@ func (a *Agent) watchEvents(ctx context.Context) error {
 
 func (a *Agent) handleDevicePlug(ev wolfapi.PlugDeviceEvent) {
 	// Wolf reports MAJOR/MINOR as "0" when it cannot stat the device node
-	// in its own container; resolve the real numbers from sysfs so both
-	// the netlink event and the hwdb filename are correct.
+	// in its own container; resolve the real numbers from sysfs so both the
+	// netlink event and the hwdb filename are correct. Each event is
+	// resolved independently; the (resolved) first event's numbers feed the
+	// hwdb filename recompute below.
 	for _, udevEvent := range ev.UdevEvents {
 		fakeudev.ResolveDevNumbers(udevEvent)
 	}
 
+	hwdbMajor, hwdbMinor := "", ""
+	if len(ev.UdevEvents) > 0 {
+		hwdbMajor, hwdbMinor = ev.UdevEvents[0]["MAJOR"], ev.UdevEvents[0]["MINOR"]
+	}
+
 	for _, entry := range ev.UdevHwDbEntries {
-		filename := entry.Filename
-		// Recompute "cMAJOR:MINOR" filenames that were built from the
-		// zeroed-out device numbers.
-		if filename == "c0:0" && len(ev.UdevEvents) > 0 {
-			if maj := ev.UdevEvents[0]["MAJOR"]; maj != "" && maj != "0" {
-				filename = "c" + maj + ":" + ev.UdevEvents[0]["MINOR"]
-			}
-		}
+		filename := fakeudev.ResolveHwDbFilename(entry.Filename, hwdbMajor, hwdbMinor)
 		if err := fakeudev.WriteHwDbEntry(UdevDataPath, filename, entry.Content); err != nil {
 			utilruntime.HandleError(fmt.Errorf("failed to write udev hwdb entry %q: %w", filename, err))
 		} else {
@@ -145,13 +145,13 @@ func (a *Agent) handleDeviceUnplug(ev wolfapi.UnplugDeviceEvent) {
 		fakeudev.ResolveDevNumbers(udevEvent)
 	}
 
+	hwdbMajor, hwdbMinor := "", ""
+	if len(ev.UdevEvents) > 0 {
+		hwdbMajor, hwdbMinor = ev.UdevEvents[0]["MAJOR"], ev.UdevEvents[0]["MINOR"]
+	}
+
 	for _, entry := range ev.UdevHwDbEntries {
-		filename := entry.Filename
-		if filename == "c0:0" && len(ev.UdevEvents) > 0 {
-			if maj := ev.UdevEvents[0]["MAJOR"]; maj != "" && maj != "0" {
-				filename = "c" + maj + ":" + ev.UdevEvents[0]["MINOR"]
-			}
-		}
+		filename := fakeudev.ResolveHwDbFilename(entry.Filename, hwdbMajor, hwdbMinor)
 		if err := fakeudev.RemoveHwDbEntry(UdevDataPath, filename); err != nil {
 			utilruntime.HandleError(fmt.Errorf("failed to remove udev hwdb entry %q: %w", filename, err))
 		}

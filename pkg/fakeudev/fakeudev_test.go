@@ -2,53 +2,95 @@ package fakeudev
 
 import (
 	"bytes"
-	"encoding/binary"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
-// Reference values computed with wolf's bundled MurmurHash2.cpp
-// (the same implementation libudev/systemd uses for filter hashes).
-func TestMurmurHash2(t *testing.T) {
-	cases := map[string]uint32{
-		"input":  3248653424,
-		"hidraw": 3268080535,
-	}
-	for in, want := range cases {
-		if got := murmurHash2([]byte(in), 0); got != want {
-			t.Errorf("murmurHash2(%q) = %d, want %d", in, got, want)
-		}
-	}
-}
-
-func TestMakeHeader(t *testing.T) {
-	h := makeHeader(100, "input", "")
-	if len(h) != 40 {
-		t.Fatalf("header length = %d, want 40", len(h))
-	}
-	if !bytes.Equal(h[:8], append([]byte("libudev"), 0)) {
-		t.Errorf("prefix = %q", h[:8])
-	}
-	if magic := binary.BigEndian.Uint32(h[8:12]); magic != udevMonitorMagic {
-		t.Errorf("magic = %#x", magic)
-	}
-	if off := binary.LittleEndian.Uint32(h[16:20]); off != 40 {
-		t.Errorf("properties_off = %d", off)
-	}
-	if l := binary.LittleEndian.Uint32(h[20:24]); l != 100 {
-		t.Errorf("properties_len = %d", l)
-	}
-	if sh := binary.BigEndian.Uint32(h[24:28]); sh != 3248653424 {
-		t.Errorf("subsystem hash = %d, want %d", sh, 3248653424)
-	}
-}
-
-func TestEncodeProperties(t *testing.T) {
-	got := encodeProperties(map[string]string{
-		"ACTION":  "add",
-		"DEVNAME": "/dev/input/event3",
+// encodeMessage must produce the same NUL-separated KEY=VALUE payload that
+// wolf's Docker runner builds via utils::map_to_string before handing the
+// message to `fake-udev -m`. Keys are emitted in sorted order.
+func TestEncodeMessage(t *testing.T) {
+	got := encodeMessage(map[string]string{
+		"DEVNAME":   "/dev/input/event3",
+		"ACTION":    "add",
+		"SUBSYSTEM": "input",
 	})
-	want := []byte("ACTION=add\x00DEVNAME=/dev/input/event3\x00")
+	want := []byte("ACTION=add\x00DEVNAME=/dev/input/event3\x00SUBSYSTEM=input\x00")
 	if !bytes.Equal(got, want) {
-		t.Errorf("encodeProperties = %q, want %q", got, want)
+		t.Errorf("encodeMessage = %q, want %q", got, want)
+	}
+}
+
+func TestResolveHwDbFilename(t *testing.T) {
+	cases := []struct {
+		name     string
+		filename string
+		major    string
+		minor    string
+		want     string
+	}{
+		{name: "recompute c0:0", filename: "c0:0", major: "13", minor: "67", want: "c13:67"},
+		{name: "leave real filename", filename: "c13:67", major: "13", minor: "67", want: "c13:67"},
+		{name: "no resolved major", filename: "c0:0", major: "0", minor: "0", want: "c0:0"},
+		{name: "non-device filename", filename: "+input:event", major: "13", minor: "67", want: "+input:event"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := ResolveHwDbFilename(c.filename, c.major, c.minor); got != c.want {
+				t.Errorf("ResolveHwDbFilename(%q, %q, %q) = %q, want %q",
+					c.filename, c.major, c.minor, got, c.want)
+			}
+		})
+	}
+}
+
+// ResolveDevNumbers should fall back to /sys/$DEVPATH/dev when MAJOR is missing
+// or "0", and mutate the map in place.
+func TestResolveDevNumbers(t *testing.T) {
+	tmp := t.TempDir()
+	sysfsDev := filepath.Join(tmp, "devices", "virtual", "input", "event3", "dev")
+	if err := os.MkdirAll(filepath.Dir(sysfsDev), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sysfsDev, []byte("13:67"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Temporarily relocate /sys onto the test tree so the resolver reads it.
+	restore := withSysfsRoot(tmp)
+	defer restore()
+
+	props := map[string]string{
+		"DEVPATH": "/devices/virtual/input/event3",
+		"MAJOR":   "0",
+		"MINOR":   "0",
+	}
+	major, minor := ResolveDevNumbers(props)
+	if major != "13" || minor != "67" {
+		t.Fatalf("ResolveDevNumbers = (%q, %q), want (13, 67)", major, minor)
+	}
+	if props["MAJOR"] != "13" || props["MINOR"] != "67" {
+		t.Errorf("props not updated: MAJOR=%q MINOR=%q", props["MAJOR"], props["MINOR"])
+	}
+}
+
+// withSysfsRoot points the package-level sysfsRoot at root for the duration
+// of a test and returns a function restoring the previous value.
+func withSysfsRoot(root string) func() {
+	prev := sysfsRoot
+	sysfsRoot = root
+	return func() { sysfsRoot = prev }
+}
+
+// When MAJOR is already populated, sysfs should not be consulted.
+func TestResolveDevNumbersAlreadyKnown(t *testing.T) {
+	props := map[string]string{
+		"DEVPATH": "/does/not/exist",
+		"MAJOR":   "244",
+		"MINOR":   "1",
+	}
+	major, minor := ResolveDevNumbers(props)
+	if major != "244" || minor != "1" {
+		t.Fatalf("ResolveDevNumbers = (%q, %q), want (244, 1)", major, minor)
 	}
 }
