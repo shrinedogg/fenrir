@@ -325,8 +325,9 @@ func (s *RESTServer) pinHandler(w http.ResponseWriter, r *http.Request) {
 	// Handle POST /pin
 	if r.Method == "POST" {
 		type PinRequest struct {
-			Pin    string `json:"pin"`
-			Secret string `secret:"secret"`
+			Pin      string `json:"pin"`
+			Secret   string `json:"secret"`
+			Username string `json:"username"`
 		}
 
 		var req PinRequest
@@ -336,15 +337,15 @@ func (s *RESTServer) pinHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if req.Pin == "" || req.Secret == "" {
+		if req.Pin == "" || req.Secret == "" || req.Username == "" {
 			w.WriteHeader(http.StatusBadRequest)
-			w.Write([]byte("Invalid request"))
+			w.Write([]byte("Invalid request: missing pin, secret, or username"))
 			return
 		}
 
 		// Provide the pin to the pair manager
-		klog.Infof("Received pin %s for secret %s", req.Pin, req.Secret)
-		err := s.manager.PostPin(req.Secret, req.Pin)
+		klog.Infof("Received pin %s for secret %s, user %s", req.Pin, req.Secret, req.Username)
+		err := s.manager.PostPin(req.Secret, req.Pin, req.Username)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			w.Write([]byte(err.Error()))

@@ -74,6 +74,7 @@ func main() {
 	pairingManager := moonlight.NewPairingManager(
 		tlsCert,
 		direwolfClient.DirewolfV1alpha1().Pairings(*namespace),
+		generic.NewLister[*direwolfv1alpha1.User](userInformer.GetIndexer()).Namespaced(*namespace),
 	)
 
 	restServer := moonlight.NewRESTServer(

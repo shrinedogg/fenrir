@@ -15,6 +15,9 @@ import (
 	"os"
 	"sync"
 
+	direwolfv1alpha1 "games-on-whales.github.io/direwolf/pkg/api/v1alpha1"
+	"games-on-whales.github.io/direwolf/pkg/generic"
+	"k8s.io/apimachinery/pkg/labels"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
@@ -31,6 +34,13 @@ func hardcodedPin() (string, bool) {
 		return "", false
 	}
 	return val, true
+}
+
+// PinSubmission is what the pin page posts: the code plus the username the
+// new pairing should be bound to.
+type PinSubmission struct {
+	Pin      string
+	Username string
 }
 
 type PairingResponse struct {
@@ -59,7 +69,7 @@ type PairingManager struct {
 	// value: pendingPairCacheEntry
 	PairingCache sync.Map // Go's equivalent of an immer::map for thread safety
 
-	// Map of pairing secret to <-chan string for pin code where a request is
+	// Map of pairing secret to <-chan PinSubmission where a request is
 	// pending
 	// key: randomly generated ephemeral secret for /pair request
 	// value: channel to send pin code
@@ -69,15 +79,20 @@ type PairingManager struct {
 	SecureServerCerificate tls.Certificate
 
 	PairingsClient v1alpha1_client.PairingInterface
+	// Resolves the pin URL from existing User CRs when logging the pairing
+	// URL in phase 1.
+	UserLister generic.NamespacedLister[*direwolfv1alpha1.User]
 }
 
 func NewPairingManager(
 	cert tls.Certificate,
 	pairingsClient v1alpha1_client.PairingInterface,
+	userLister generic.NamespacedLister[*direwolfv1alpha1.User],
 ) *PairingManager {
 	return &PairingManager{
 		SecureServerCerificate: cert,
 		PairingsClient:         pairingsClient,
+		UserLister:             userLister,
 	}
 }
 
@@ -86,7 +101,7 @@ func failPair(statusMsg string) PairingResponse {
 	return PairingResponse{Paired: 0, Response: Response{StatusCode: 400, StatusMessage: statusMsg}}
 }
 
-func (m *PairingManager) PostPin(secret string, pin string) error {
+func (m *PairingManager) PostPin(secret string, pin string, username string) error {
 	channel, found := m.PendingPins.Load(secret)
 	if !found {
 		err := fmt.Errorf("no pending pin for secret %s", secret)
@@ -94,7 +109,7 @@ func (m *PairingManager) PostPin(secret string, pin string) error {
 	}
 
 	select {
-	case channel.(chan string) <- pin:
+	case channel.(chan PinSubmission) <- PinSubmission{Pin: pin, Username: username}:
 		klog.Infof("Sent pin %s to channel for secret %s", pin, secret)
 		return nil
 	default:
@@ -150,21 +165,32 @@ func (m *PairingManager) pairPhase1(cacheKey string, salt string, clientCertStr 
 	pinSecretHex := hex.EncodeToString(pinSecret)
 
 	// Store the pin secret
-	pinChannel := make(chan string, 1)
+	pinChannel := make(chan PinSubmission, 1)
 	defer close(pinChannel)
 	defer m.PendingPins.Delete(pinSecretHex)
 	m.PendingPins.Store(pinSecretHex, pinChannel)
 
-	//!TODO: Get proper hostname
-	klog.Infof("Insert pin at http://%s/pin/#%s", "127.0.0.1:47989", pinSecretHex)
+	// Log a usable pin URL. Every user pairs against the same proxy
+	// Service, so any user's status carries the same address.
+	pinBaseURL := ""
+	if m.UserLister != nil {
+		users, err := m.UserLister.List(labels.Everything())
+		if err == nil && len(users) > 0 {
+			pinBaseURL = users[0].Status.PublicPinURL
+		}
+	}
+	if pinBaseURL == "" {
+		pinBaseURL = "http://127.0.0.1:47989/pin/"
+	}
+	klog.Infof("Insert pin at %s#%s", pinBaseURL, pinSecretHex)
 
 	// Hardcoded pin for testing in debug builds if debugger is attached
-	var pin string
+	var submission PinSubmission
 	if hardcoded, ok := hardcodedPin(); ok {
 		klog.Infof("Debugger attached, using hardcoded pin")
-		pin = hardcoded
+		submission = PinSubmission{Pin: hardcoded, Username: "debug-user"}
 	} else {
-		pin = <-pinChannel
+		submission = <-pinChannel
 	}
 
 	// Generate server cert and AES key
@@ -172,8 +198,8 @@ func (m *PairingManager) pairPhase1(cacheKey string, salt string, clientCertStr 
 	m.PairingCache.Store(cacheKey, pendingPairCacheEntry{
 		ClientCert: clientCert,
 		LastPhase:  "GETSERVERCERT",
-		Username:   "alex", // TODO: TEMPORARY: We should serve the PIN auth page under authenticated SSL to get username
-		AESKey:     util.Hash(saltData[:16], []byte(pin))[:16],
+		Username:   submission.Username,
+		AESKey:     util.Hash(saltData[:16], []byte(submission.Pin))[:16],
 	})
 
 	// Send hex encoded server cert pem

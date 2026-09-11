@@ -74,6 +74,10 @@ type SidecarPolicies struct {
 }
 
 type UserStatus struct {
+	// The public Pin URL used to pair the user.
+	// Populated by the user controller from the moonlight-proxy Service.
+	// +optional
+	PublicPinURL string `json:"publicPinURL,omitempty"`
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object

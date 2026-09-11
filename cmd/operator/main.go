@@ -14,6 +14,7 @@ import (
 	"games-on-whales.github.io/direwolf/pkg/util"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
@@ -32,6 +33,7 @@ func main() {
 	holderIdentity := flag.String("holder-identity", os.Getenv("POD_NAME"), "Holder identity")
 	namespace := flag.String("namespace", os.Getenv("POD_NAMESPACE"), "Namespace to watch")
 	lbSharingKey := flag.String("lb-sharing-key", os.Getenv("POD_NAMESPACE"), "LoadBalancer sharing key")
+	proxySvcName := flag.String("proxy-service-name", "direwolf", "Name of the moonlight-proxy Service, used to publish the pin URL on User CRs")
 	klog.InitFlags(nil)
 	flag.Parse()
 
@@ -53,6 +55,7 @@ func main() {
 	k8sFactory := informers.NewSharedInformerFactoryWithOptions(
 		k8sClient, 15*time.Minute, informers.WithNamespace(*namespace))
 	deploymentInformer := k8sFactory.Apps().V1().Deployments().Informer()
+	serviceInformer := k8sFactory.Core().V1().Services().Informer()
 	k8sFactory.Start(appContext.Done())
 	defer k8sFactory.Shutdown()
 
@@ -90,6 +93,16 @@ func main() {
 		},
 	)
 
+	userController := controllers.NewUserController(
+		k8sClient,
+		direwolfClient.DirewolfV1alpha1().Users(*namespace),
+		generic.NewInformer[*direwolfv1alpha1.User](userInformer),
+		generic.NewInformer[*corev1.Service](serviceInformer),
+		controllers.UserControllerOptions{
+			ProxyServiceName: *proxySvcName,
+		},
+	)
+
 	leaderelection.RunOrDie(appContext, leaderelection.LeaderElectionConfig{
 		Lock:          lock,
 		LeaseDuration: 15 * time.Second,
@@ -98,7 +111,12 @@ func main() {
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(ctx context.Context) {
 				klog.Info("started leading")
-				err := sessionController.Run(appContext)
+				go func() {
+					if err := userController.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+						klog.Errorf("error running user controller: %v", err)
+					}
+				}()
+				err := sessionController.Run(ctx)
 				if err != nil && !errors.Is(err, context.Canceled) {
 					klog.Errorf("error running session controller: %v", err)
 					appCancel()
