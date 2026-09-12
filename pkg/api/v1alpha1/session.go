@@ -104,12 +104,29 @@ type SessionInfo struct {
 	SurroundAudioFlags int `json:"surroundAudioFlags,omitempty"`
 }
 
-// Each session will have 4 ports allocated to it on the shared gateway.
-// Using port forward allows us to avoid the need for a separate IP per session
-// or a relay which could add latency to the stream.
+// Each session will have a block of 4 ports allocated to it on the shared
+// gateway VIP. Using port forward allows us to avoid the need for a separate
+// IP per session or a relay which could add latency to the stream.
+//
+// All per-session RTP Services share one LoadBalancer VIP (see the
+// lb-sharing-key annotation), so the ports must be unique per session: the
+// Moonlight client dials VIP:port for RTSP and, after the RTSP SETUP response,
+// VIP:<video/audio/control> for the media, and only the port distinguishes one
+// session's Service from another's. wolf listens on and advertises exactly
+// these ports via WOLF_RTSP_SETUP_PORT / WOLF_CONTROL_PORT /
+// WOLF_VIDEO_PING_PORT / WOLF_AUDIO_PING_PORT, so the operator sets them
+// per session.
 type SessionPorts struct {
-	RTSP     int32 `json:"rtsp,omitempty"`
-	Control  int32 `json:"control,omitempty"`
+	// Agent is the wolf-agent API port. It is exposed on the shared VIP too
+	// (so it must be unique per session) and dialed by the operator via the
+	// per-session Service.
+	Agent int32 `json:"agent,omitempty"`
+	// RTSP is the wolf RTSP setup port (Moonlight RTSP handshake).
+	RTSP int32 `json:"rtsp,omitempty"`
+	// Control is the wolf ENET/control port (Moonlight input).
+	Control int32 `json:"control,omitempty"`
+	// VideoRTP is the wolf video RTP port.
 	VideoRTP int32 `json:"videoRTP,omitempty"`
+	// AudioRTP is the wolf audio RTP port.
 	AudioRTP int32 `json:"audioRTP,omitempty"`
 }

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"reflect"
+	"sync"
 	"time"
 
 	"games-on-whales.github.io/direwolf/pkg/api/v1alpha1"
@@ -84,6 +85,14 @@ type SessionController struct {
 	trackedSessions map[userGame]sets.Set[string]
 	trackedGames    map[string]userGame
 
+	// portMu serializes port allocation between the session controller's
+	// worker goroutines (Workers: 2). portsReserved is the in-process record
+	// of which port block each live session holds; it is re-seeded from the
+	// persisted Status.Ports of live sessions, so it is reconstructed on an
+	// operator restart. See allocatePorts.
+	portMu        sync.Mutex
+	portsReserved map[string]int32 // "<namespace>/<name>" -> allocated block index
+
 	controller           generic.Controller[*v1alpha1types.Session]
 	deploymentController generic.Controller[*appsv1.Deployment]
 	SessionControllerOptions
@@ -111,6 +120,7 @@ func NewSessionController(
 		UserInformer:             userInformer,
 		trackedSessions:          make(map[userGame]sets.Set[string]),
 		trackedGames:             make(map[string]userGame),
+		portsReserved:            make(map[string]int32),
 		SessionControllerOptions: options,
 	}
 
@@ -236,6 +246,15 @@ func (c *SessionController) Reconcile(namespace, name string, newObj *v1alpha1ty
 
 			delete(c.trackedGames, name)
 		}
+
+		// Release this session's port block so a future session can reuse it.
+		// The authoritative "in use" record is the live sessions' status, so a
+		// block becomes free the moment its session disappears from the cache;
+		// dropping the in-memory entry keeps the two records consistent.
+		c.portMu.Lock()
+		delete(c.portsReserved, namespace+"/"+name)
+		c.portMu.Unlock()
+
 		return nil
 	} else if newObj.Status.WolfSessionID == "" && newObj.CreationTimestamp.Add(1*time.Minute).Before(time.Now()) {
 		klog.Infof("Session %s/%s is older than 1 minute and has no wolf session ID, deleting", newObj.Namespace, newObj.Name)
@@ -533,29 +552,19 @@ func (c *SessionController) reconcileService(ctx context.Context, session *v1alp
 
 	session.Status.ServiceName = fmt.Sprintf("%s-rtp", clampString(session.Name, 56))
 
-	// HACK: Delete all direwolf-worker services that dont match the service name
-	// This is until we can control the ports in wolf
-	allServices, err := c.K8sClient.CoreV1().Services(session.Namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: "app=direwolf-worker",
-	})
-
-	if err != nil {
-		return fmt.Errorf("failed to list services: %s", err)
-	}
-
-	for _, svc := range allServices.Items {
-		if svc.Name != session.Status.ServiceName {
-			klog.Infof("Deleting service %s/%s", svc.Namespace, svc.Name)
-			err := c.K8sClient.CoreV1().Services(svc.Namespace).Delete(ctx, svc.Name, metav1.DeleteOptions{})
-			if err != nil {
-				klog.Errorf("Failed to delete service %s/%s: %s", svc.Namespace, svc.Name, err)
-				return fmt.Errorf("failed to delete service %s/%s: %s", svc.Namespace, svc.Name, err)
-			}
-		}
-	}
+	// We deliberately do NOT delete other sessions' services here. An earlier
+	// hack did, because every session's Service used the same set of ports on
+	// the shared LB VIP, so only one could be bound at a time and a new session
+	// would knock the existing one out. Now each session is allocated a unique
+	// port block (see allocatePorts) and wolf listens on it, so every session's
+	// Service coexists on the shared VIP. Each Service is owned by its Session
+	// (see the controller ownerReference below), so Kubernetes garbage
+	// collects it when the Session is deleted — no cross-session deletion
+	// needed, and none allowed: it is what was tearing concurrent streams
+	// down in a delete/recreate loop.
 
 	// 1. Use the set up a service with correct ports pointing to the pods
-	_, err = c.K8sClient.CoreV1().
+	_, err := c.K8sClient.CoreV1().
 		Services(session.Namespace).
 		Apply(
 			context.Background(),
@@ -590,7 +599,8 @@ func (c *SessionController) reconcileService(ctx context.Context, session *v1alp
 						WithPorts(
 							v1ac.ServicePort().
 								WithName("wa"). // wolf-agent
-								WithPort(8443),
+								WithPort(session.Status.Ports.Agent).
+								WithTargetPort(intstr.FromInt(8443)),
 							v1ac.ServicePort().
 								WithName("rtsp"). // moonlight-rtsp
 								WithPort(session.Status.Ports.RTSP),
@@ -816,6 +826,17 @@ func (c *SessionController) reconcilePod(ctx context.Context, session *v1alpha1t
 	if session.Spec.Config.ClientIP != "" {
 		wolfEnvVars["WOLF_STREAM_CLIENT_IP"] = session.Spec.Config.ClientIP
 	}
+
+	// Tell wolf to listen on this session's allocated ports and advertise them
+	// in the RTSP SETUP response. Without this every wolf listens on its
+	// default ports, so on the shared VIP (which all session Services share)
+	// the sessions would collide. wolf reads these and echoes them to the
+	// client as the video/audio/control stream ports.
+	wolfEnvVars["WOLF_RTSP_SETUP_PORT"] = fmt.Sprint(session.Status.Ports.RTSP)
+	wolfEnvVars["WOLF_CONTROL_PORT"] = fmt.Sprint(session.Status.Ports.Control)
+	wolfEnvVars["WOLF_VIDEO_PING_PORT"] = fmt.Sprint(session.Status.Ports.VideoRTP)
+	wolfEnvVars["WOLF_AUDIO_PING_PORT"] = fmt.Sprint(session.Status.Ports.AudioRTP)
+
 	var podToCreate corev1.PodTemplateSpec
 	if app.Spec.Template != nil {
 		podToCreate.ObjectMeta = app.Spec.Template.ObjectMeta
@@ -1526,28 +1547,105 @@ func (c *SessionController) deploymentName(session *v1alpha1types.Session) strin
 	return fmt.Sprintf("%s-%s", session.Spec.UserReference.Name, session.Spec.GameReference.Name)
 }
 
+// Port allocation on the shared gateway VIP.
+//
+// Every per-session RTP Service shares one LoadBalancer VIP (see the
+// lb-sharing-key annotation in reconcileService), so the Moonlight client is
+// disambiguated only by port. wolf listens on and advertises the stream ports
+// via WOLF_RTSP_SETUP_PORT / WOLF_CONTROL_PORT / WOLF_VIDEO_PING_PORT /
+// WOLF_AUDIO_PING_PORT, so the operator allocates a unique block of 4 ports per
+// session (plus a unique wolf-agent port, also exposed on the VIP) and tells
+// wolf to use them.
+//
+// Each session is assigned an integer block index; block 0 is the original
+// hardcoded ports, so a deployment with a single live session is byte-for-byte
+// identical to before this change. Blocks are spaced by portBlockStride so a
+// block's ports never overlap a neighbouring block's.
+const (
+	portBlockStride int32 = 1000
+
+	baseAgent    int32 = 8443
+	baseRTSP     int32 = 48010
+	baseControl  int32 = 47999
+	baseVideoRTP int32 = 48100
+	baseAudioRTP int32 = 48200
+)
+
+// portsForBlock returns the full port set for a given block index.
+func portsForBlock(i int32) v1alpha1types.SessionPorts {
+	return v1alpha1types.SessionPorts{
+		Agent:    baseAgent + i*portBlockStride,
+		RTSP:     baseRTSP + i*portBlockStride,
+		Control:  baseControl + i*portBlockStride,
+		VideoRTP: baseVideoRTP + i*portBlockStride,
+		AudioRTP: baseAudioRTP + i*portBlockStride,
+	}
+}
+
+// blockIndexFor recovers a session's block index from a persisted allocation,
+// or -1 if the session has none yet (RTSP is the marker: it is always set once
+// a block is assigned and is unique to the high-port range).
+func blockIndexFor(ports v1alpha1types.SessionPorts) int32 {
+	if ports.RTSP == 0 {
+		return -1
+	}
+	return (ports.RTSP - baseRTSP) / portBlockStride
+}
+
+// maxPortBlockIndex is the highest block index whose ports all fit in
+// 1..65535 (audioRTP is the largest port in a block).
+func maxPortBlockIndex() int32 {
+	return (65535 - baseAudioRTP) / portBlockStride
+}
+
 func (c *SessionController) allocatePorts(
 	ctx context.Context,
 	session *v1alpha1types.Session,
 ) error {
-	//!TODO: Take lock if multiple workers are running
+	c.portMu.Lock()
+	defer c.portMu.Unlock()
 
-	// 0. Allocate ports for this streaming session to use
-	// 1. List all listeners for the gateway
-	// 2. List all routes attached to the gateway
-	// 3. Subtract used ports
-	// 4. Choose a port for RTSP, Enet, Video RTP, Audio RTP
-
-	//!TODO: Implement this properly once wolf lets us assign ports. For now, just
-	// hardcode some ports.
-	session.Status.Ports = v1alpha1types.SessionPorts{
-		RTSP:     48010,
-		Control:  47999,
-		VideoRTP: 48100,
-		AudioRTP: 48200,
+	// Sticky: a session that already has an allocation keeps it. Reconciles
+	// and operator restarts must never re-assign a running session, or its
+	// listening ports and the Service would churn mid-stream.
+	if i := blockIndexFor(session.Status.Ports); i >= 0 {
+		session.Status.Ports = portsForBlock(i)
+		c.portsReserved[session.Namespace+"/"+session.Name] = i
+		return nil
 	}
 
-	return nil
+	// Determine which blocks are in use. The authoritative record is the
+	// persisted Status.Ports of every live session (correct across operator
+	// restarts and leak-free); the in-memory map additionally covers the
+	// not-yet-persisted window for sessions that were created concurrently by
+	// the controller's two workers.
+	sessions, err := c.SessionInformer.Namespaced(session.Namespace).List(labels.Everything())
+	if err != nil {
+		return fmt.Errorf("failed to list sessions for port allocation: %w", err)
+	}
+	taken := make(map[int32]bool)
+	for _, s := range sessions {
+		if s == nil || s.Name == session.Name {
+			continue
+		}
+		if i := blockIndexFor(s.Status.Ports); i >= 0 {
+			taken[i] = true
+		}
+	}
+	for _, i := range c.portsReserved {
+		taken[i] = true
+	}
+
+	for i := int32(0); i <= maxPortBlockIndex(); i++ {
+		if !taken[i] {
+			session.Status.Ports = portsForBlock(i)
+			c.portsReserved[session.Namespace+"/"+session.Name] = i
+			klog.Infof("Allocated port block %d (%+v) to session %s/%s", i, session.Status.Ports, session.Namespace, session.Name)
+			return nil
+		}
+	}
+
+	return fmt.Errorf("no free port block for session %s/%s (max %d concurrent sessions)", session.Namespace, session.Name, maxPortBlockIndex()+1)
 }
 
 // reconcileActiveStreams calls out to wolf-agent on the running pod to ensure
@@ -1580,7 +1678,9 @@ func (c *SessionController) reconcileActiveStreams(
 	// Ensure they match each of our k8s sessions. Hash on AESKey/IV
 	// In the future it might make sense to just match on ClientID/ClientCertFingerprint
 	// but that is hardcoded for now :)
-	wolfclient := wolfapi.NewClient(fmt.Sprintf("https://%s:8443", service.Spec.ClusterIP), &http.Client{
+	// Dial the wolf-agent through this session's Service, on the per-session
+	// external agent port (it forwards to the agent's fixed in-pod 8443).
+	wolfclient := wolfapi.NewClient(fmt.Sprintf("https://%s:%d", service.Spec.ClusterIP, session.Status.Ports.Agent), &http.Client{
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		},

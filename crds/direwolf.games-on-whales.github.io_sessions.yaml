@@ -189,16 +189,29 @@ spec:
               ports:
                 description: The ports allocated to the session on the shared gateway.
                 properties:
+                  agent:
+                    description: |-
+                      Agent is the wolf-agent API port. It is exposed on the shared VIP too
+                      (so it must be unique per session) and dialed by the operator via the
+                      per-session Service.
+                    format: int32
+                    type: integer
                   audioRTP:
+                    description: AudioRTP is the wolf audio RTP port.
                     format: int32
                     type: integer
                   control:
+                    description: Control is the wolf ENET/control port (Moonlight
+                      input).
                     format: int32
                     type: integer
                   rtsp:
+                    description: RTSP is the wolf RTSP setup port (Moonlight RTSP
+                      handshake).
                     format: int32
                     type: integer
                   videoRTP:
+                    description: VideoRTP is the wolf video RTP port.
                     format: int32
                     type: integer
                 type: object
