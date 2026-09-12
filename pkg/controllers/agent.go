@@ -3,10 +3,16 @@ package controllers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 
 	"games-on-whales.github.io/direwolf/pkg/fakeudev"
 	"games-on-whales.github.io/direwolf/pkg/wolfapi"
+	"golang.org/x/sys/unix"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/klog/v2"
 )
@@ -15,6 +21,14 @@ import (
 // devices. It must be a volume shared with the app container (mounted at
 // /run/udev there) for libudev consumers (SDL/Steam) to see them.
 const UdevDataPath = "/run/udev/data"
+
+// DevInputPath is the pod-private /dev/input directory (an emptyDir shared
+// between the app container and this agent). The agent creates device nodes
+// here only for the devices wolf hotplugs for THIS session. No session pod
+// mounts the host's /dev/input, so uinput devices belonging to other
+// sessions on the same node (other wolves' pads, Steam Input virtual
+// controllers) have no node here and are invisible to SDL/libinput/Steam.
+const DevInputPath = "/dev/input"
 
 // Represents the controller that runs inside the Pod itself
 type Agent struct {
@@ -131,6 +145,14 @@ func (a *Agent) handleDevicePlug(ev wolfapi.PlugDeviceEvent) {
 		}
 	}
 
+	// Create the device node in the pod-private /dev/input BEFORE the fake
+	// udev event is sent, so consumers reacting to the event can open the
+	// node immediately. This is what scopes input to this session: only the
+	// devices wolf reports for this session ever get a node in the pod.
+	for _, udevEvent := range ev.UdevEvents {
+		createDeviceNode(udevEvent)
+	}
+
 	for _, udevEvent := range ev.UdevEvents {
 		if err := fakeudev.SendEvent(udevEvent); err != nil {
 			utilruntime.HandleError(fmt.Errorf("failed to send udev event for %q: %w", udevEvent["DEVNAME"], err))
@@ -159,10 +181,76 @@ func (a *Agent) handleDeviceUnplug(ev wolfapi.UnplugDeviceEvent) {
 
 	for _, udevEvent := range ev.UdevEvents {
 		udevEvent["ACTION"] = "remove"
+		// Remove the device node from the pod-private /dev/input so the
+		// app stops seeing the device (mirrors the real udev behaviour).
+		removeDeviceNode(udevEvent)
 		if err := fakeudev.SendEvent(udevEvent); err != nil {
 			utilruntime.HandleError(fmt.Errorf("failed to send udev remove event for %q: %w", udevEvent["DEVNAME"], err))
 		} else {
 			klog.InfoS("Sent fake udev remove event", "devname", udevEvent["DEVNAME"], "session", ev.SessionID)
 		}
 	}
+}
+
+// deviceNodePath returns the path of the device node inside the pod-private
+// /dev/input for a udev event, or "" if the event has no DEVNAME or the
+// DEVNAME is not under /dev/input.
+func deviceNodePath(udevEvent map[string]string) string {
+	devname := udevEvent["DEVNAME"]
+	if devname == "" {
+		return ""
+	}
+	if !strings.HasPrefix(devname, "/dev/input/") {
+		// Not an input device node (e.g. /dev/uinput itself); nothing to do.
+		return ""
+	}
+	return filepath.Join(DevInputPath, strings.TrimPrefix(devname, "/dev/input/"))
+}
+
+// createDeviceNode mknods the device into the pod-private /dev/input using
+// the (sysfs-resolved) MAJOR/MINOR carried by the udev event. The node is
+// created world-accessible (0666) because the app runs as a different,
+// non-root uid than the agent.
+func createDeviceNode(udevEvent map[string]string) {
+	node := deviceNodePath(udevEvent)
+	if node == "" {
+		return
+	}
+	major, err1 := strconv.Atoi(udevEvent["MAJOR"])
+	minor, err2 := strconv.Atoi(udevEvent["MINOR"])
+	if err1 != nil || err2 != nil || (major == 0 && minor == 0) {
+		// Without usable numbers we cannot create a node; skip (the fake
+		// udev event is still sent, so the app may notice the device via
+		// sysfs, but it won't be able to open it).
+		klog.InfoS("Skipping device node creation: no MAJOR/MINOR", "devname", udevEvent["DEVNAME"])
+		return
+	}
+	mode := uint32(unix.S_IFCHR | 0o666)
+	dev := unix.Mkdev(uint32(major), uint32(minor))
+	if err := unix.Mknod(node, mode, int(dev)); err != nil {
+		if errors.Is(err, unix.EEXIST) {
+			// Node already exists (e.g. session restart re-plug); ensure
+			// permissions in case the previous owner was more restrictive.
+			if chmodErr := os.Chmod(node, 0o666); chmodErr != nil {
+				utilruntime.HandleError(fmt.Errorf("failed to chmod %q: %w", node, chmodErr))
+			}
+			return
+		}
+		utilruntime.HandleError(fmt.Errorf("failed to mknod %q: %w", node, err))
+		return
+	}
+	klog.InfoS("Created device node", "node", node, "major", major, "minor", minor)
+}
+
+// removeDeviceNode unlinks the device node from the pod-private /dev/input.
+func removeDeviceNode(udevEvent map[string]string) {
+	node := deviceNodePath(udevEvent)
+	if node == "" {
+		return
+	}
+	if err := os.Remove(node); err != nil && !errors.Is(err, os.ErrNotExist) {
+		utilruntime.HandleError(fmt.Errorf("failed to remove %q: %w", node, err))
+		return
+	}
+	klog.InfoS("Removed device node", "node", node)
 }

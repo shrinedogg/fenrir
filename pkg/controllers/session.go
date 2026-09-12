@@ -708,6 +708,20 @@ func validateVolumeMounts(mounts []corev1.VolumeMount, validVolumes map[string]s
 	return nil
 }
 
+// withoutMountPath returns the mounts with any entry at the given path
+// removed. Used to drop sidecar-policy mounts that would collide with the
+// pod-private /dev/input the operator always mounts at that path.
+func withoutMountPath(mounts []corev1.VolumeMount, path string) []corev1.VolumeMount {
+	out := make([]corev1.VolumeMount, 0, len(mounts))
+	for _, vm := range mounts {
+		if vm.MountPath == path {
+			continue
+		}
+		out = append(out, vm)
+	}
+	return out
+}
+
 func (c *SessionController) reconcilePod(ctx context.Context, session *v1alpha1types.Session) error {
 	//!TODO: Just allocate a ton of ports on the container, we wont be able to
 	// change them while its running if another user connects
@@ -793,7 +807,7 @@ func (c *SessionController) reconcilePod(ctx context.Context, session *v1alpha1t
 		"PULSE_SERVER":           "unix:/tmp/.X11-unix/pulse-socket",
 		"HOST_APPS_STATE_FOLDER": "/mnt/data/wolf",
 		// "WOLF_STREAM_CLIENT_IP":  "10.128.1.0", //Need to find the correct streaming id / ingress, later.
-		"WOLF_SOCKET_PATH":       "/etc/wolf/wolf.sock", 
+		"WOLF_SOCKET_PATH": "/etc/wolf/wolf.sock",
 		// "WOLF_CFG_FILE":          "/etc/wolf/cfg/config.toml", // no longer needed
 		// "WOLF_PRIVATE_CERT_FILE": "/mnt/data/wolf/cfg/cert.pem",
 		// "WOLF_PRIVATE_KEY_FILE": "/mnt/data/wolf/cfg/key.pem",
@@ -870,11 +884,33 @@ func (c *SessionController) reconcilePod(ctx context.Context, session *v1alpha1t
 	wolfEnvVarsSlice := make([]corev1.EnvVar, 0, len(wolfEnvVars))
 	for k, v := range wolfEnvVars {
 		wolfEnvVarsSlice = append(wolfEnvVarsSlice, corev1.EnvVar{Name: k, Value: v})
- 	}
-
+	}
 
 	// Inject volume mounts into existing containers
 	for i := range podToCreate.Spec.Containers {
+		// Scope input devices to this session: any App-CR mount of the
+		// host's /dev/input is repointed at the pod-private "wolf-dev-input"
+		// emptyDir, and the mount is ensured even if the App CR doesn't ask
+		// for one. The wolf-agent mknods only this session's devices into it
+		// (see agent.go); input devices created by other sessions' wolves or
+		// by Steam Input on the shared host /dev/input get no node in this
+		// pod and are invisible to SDL/libinput/Steam here.
+		hasDevInput := false
+		for j := range podToCreate.Spec.Containers[i].VolumeMounts {
+			if podToCreate.Spec.Containers[i].VolumeMounts[j].MountPath == "/dev/input" {
+				podToCreate.Spec.Containers[i].VolumeMounts[j].Name = "wolf-dev-input"
+				hasDevInput = true
+			}
+		}
+		if !hasDevInput {
+			podToCreate.Spec.Containers[i].VolumeMounts = append(podToCreate.Spec.Containers[i].VolumeMounts,
+				corev1.VolumeMount{
+					Name:      "wolf-dev-input",
+					MountPath: "/dev/input",
+				},
+			)
+		}
+
 		podToCreate.Spec.Containers[i].VolumeMounts = append(podToCreate.Spec.Containers[i].VolumeMounts,
 			corev1.VolumeMount{
 				Name:      "wolf-runtime",
@@ -895,7 +931,7 @@ func (c *SessionController) reconcilePod(ctx context.Context, session *v1alpha1t
 			{Name: "WAYLAND_DISPLAY", Value: "wayland-1"},
 			{Name: "TZ", Value: wolfEnvVars["TZ"]},
 			{Name: "UNAME", Value: "retro"},
-			{Name: "XDG_RUNTIME_DIR", Value: "/tmp/.X11-unix"},			// "UID":             "1000",
+			{Name: "XDG_RUNTIME_DIR", Value: "/tmp/.X11-unix"}, // "UID":             "1000",
 			// "GID":             "1000",
 			{Name: "PULSE_SERVER", Value: "unix:/tmp/.X11-unix/pulse-socket"},
 			// PULSE_SINK & PULSE_SOURCE set at runtime calculated based off session ID.
@@ -1058,10 +1094,31 @@ func (c *SessionController) reconcilePod(ctx context.Context, session *v1alpha1t
 	// Apply HostIPC setting to the pod spec if requested by any sidecar policy
 	podToCreate.Spec.HostIPC = podHostIPC
 
+	// The agent's /dev/input is always the pod-private wolf-dev-input volume;
+	// drop any sidecar-policy mount that would conflict at that path.
+	wolfAgentVolumeMounts = withoutMountPath(wolfAgentVolumeMounts, "/dev/input")
+
+	// The wolf-agent must run as root with CAP_MKNOD so it can create this
+	// session's input device nodes in the pod-private /dev/input (agent.go).
+	// Whatever the User CR sidecar policy says, these are forced.
+	if wolfAgentSecurityContext == nil {
+		wolfAgentSecurityContext = &corev1.SecurityContext{}
+	} else {
+		wolfAgentSecurityContext = wolfAgentSecurityContext.DeepCopy()
+	}
+	wolfAgentSecurityContext.RunAsUser = ptr.To[int64](0)
+	wolfAgentSecurityContext.RunAsGroup = ptr.To[int64](0)
+	if wolfAgentSecurityContext.Capabilities == nil {
+		wolfAgentSecurityContext.Capabilities = &corev1.Capabilities{}
+	}
+	if !sets.New(wolfAgentSecurityContext.Capabilities.Add...).Has(corev1.Capability("MKNOD")) {
+		wolfAgentSecurityContext.Capabilities.Add = append(wolfAgentSecurityContext.Capabilities.Add, "MKNOD")
+	}
+
 	podToCreate.Spec.Containers = append(podToCreate.Spec.Containers,
 		corev1.Container{
-			Name:  "wolf-agent",
-			Image: c.WolfAgentImage,
+			Name:            "wolf-agent",
+			Image:           c.WolfAgentImage,
 			ImagePullPolicy: corev1.PullAlways,
 			// ImagePullPolicy: corev1.PullIfNotPresent,
 			Args: []string{
@@ -1075,47 +1132,47 @@ func (c *SessionController) reconcilePod(ctx context.Context, session *v1alpha1t
 				},
 			},
 			Env: append([]corev1.EnvVar{
-					{
-						Name:  "XDG_RUNTIME_DIR",
-						Value: "/tmp/.X11-unix",
-					},
-					// {
-					// 	Name:  "PUID",
-					// 	Value: "1000",
-					// },
-					// {
-					// 	Name:  "PGID",
-					// 	Value: "1000",
-					// },
-					{
-						Name:  "WOLF_SOCKET_PATH",
-						Value: "/etc/wolf/wolf.sock",
-					},
-					{
-						Name:  "DIREWOLF_USER",
-						Value: session.Spec.UserReference.Name,
-					},
-					{
-						Name:  "DIREWOLF_APP",
-						Value: session.Spec.GameReference.Name,
-					},
-					{
-						Name: "POD_NAME",
-						ValueFrom: &corev1.EnvVarSource{
-							FieldRef: &corev1.ObjectFieldSelector{
-								FieldPath: "metadata.name",
-							},
+				{
+					Name:  "XDG_RUNTIME_DIR",
+					Value: "/tmp/.X11-unix",
+				},
+				// {
+				// 	Name:  "PUID",
+				// 	Value: "1000",
+				// },
+				// {
+				// 	Name:  "PGID",
+				// 	Value: "1000",
+				// },
+				{
+					Name:  "WOLF_SOCKET_PATH",
+					Value: "/etc/wolf/wolf.sock",
+				},
+				{
+					Name:  "DIREWOLF_USER",
+					Value: session.Spec.UserReference.Name,
+				},
+				{
+					Name:  "DIREWOLF_APP",
+					Value: session.Spec.GameReference.Name,
+				},
+				{
+					Name: "POD_NAME",
+					ValueFrom: &corev1.EnvVarSource{
+						FieldRef: &corev1.ObjectFieldSelector{
+							FieldPath: "metadata.name",
 						},
 					},
-					{
-						Name: "POD_NAMESPACE",
-						ValueFrom: &corev1.EnvVarSource{
-							FieldRef: &corev1.ObjectFieldSelector{
-								FieldPath: "metadata.namespace",
-							},
+				},
+				{
+					Name: "POD_NAMESPACE",
+					ValueFrom: &corev1.EnvVarSource{
+						FieldRef: &corev1.ObjectFieldSelector{
+							FieldPath: "metadata.namespace",
 						},
 					},
-				},wolfAgentEnv...
+				},
+			}, wolfAgentEnv...,
 			),
 			ReadinessProbe: &corev1.Probe{
 				ProbeHandler: corev1.ProbeHandler{
@@ -1145,6 +1202,12 @@ func (c *SessionController) reconcilePod(ctx context.Context, session *v1alpha1t
 				{
 					Name:      "wolf-runtime",
 					MountPath: "/tmp/.X11-unix",
+				},
+				{
+					// Pod-private /dev/input shared with the app container; the
+					// agent mknods this session's devices into it (see agent.go).
+					Name:      "wolf-dev-input",
+					MountPath: "/dev/input",
 				},
 			}, wolfAgentVolumeMounts...),
 		},
@@ -1272,6 +1335,15 @@ func (c *SessionController) reconcilePod(ctx context.Context, session *v1alpha1t
 		},
 		corev1.Volume{
 			Name: "wolf-runtime",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		},
+		corev1.Volume{
+			// Pod-private /dev/input. The wolf-agent mknods only this
+			// session's input devices into it (agent.go); the host's global
+			// uinput devices from other sessions never appear here.
+			Name: "wolf-dev-input",
 			VolumeSource: corev1.VolumeSource{
 				EmptyDir: &corev1.EmptyDirVolumeSource{},
 			},
@@ -1806,9 +1878,9 @@ func (c *SessionController) reconcileActiveStreams(
 		}
 
 		sessionID, err := wolfclient.AddSession(ctx, wolfapi.Session{
-			VideoWidth:        session.Spec.Config.VideoWidth,
-			VideoHeight:       session.Spec.Config.VideoHeight,
-			VideoRefreshRate:  session.Spec.Config.VideoRefreshRate,
+			VideoWidth:       session.Spec.Config.VideoWidth,
+			VideoHeight:      session.Spec.Config.VideoHeight,
+			VideoRefreshRate: session.Spec.Config.VideoRefreshRate,
 			// AppID:             appID,
 			AudioChannelCount: 2, // !TODO: parse from audio info
 
