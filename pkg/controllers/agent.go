@@ -47,11 +47,47 @@ func NewAgent(
 
 func (a *Agent) Run(ctx context.Context) error {
 	klog.Infof("Starting Agent")
+
+	// Sanitize the pod-private /dev/input. For privileged containers runc
+	// walks the host /dev AFTER applying volume mounts and copies every
+	// host device node into the container's /dev (verified: a bare
+	// privileged busybox with an emptyDir at /dev/input receives the whole
+	// host input node set, including other sessions' wolf pads if they
+	// exist at container start). Everything present before the first
+	// PlugDevice event is such a coldplug copy; this session's devices
+	// only ever arrive here afterwards via createDeviceNode. Remove them
+	// all so the pod starts with an input namespace that contains exactly
+	// this session's devices.
+	if err := sanitizeDevInput(); err != nil {
+		utilruntime.HandleError(fmt.Errorf("failed to sanitize %s: %w", DevInputPath, err))
+	}
+
 	if err := a.watchEvents(ctx); err != nil {
 		return err
 	}
 
 	klog.Infof("Agent started")
+	return nil
+}
+
+// sanitizeDevInput removes every entry from the pod-private /dev/input,
+// including the by-id/by-path symlinks runc's coldplug leaves behind.
+func sanitizeDevInput() error {
+	entries, err := os.ReadDir(DevInputPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	removed := 0
+	for _, e := range entries {
+		if err := os.Remove(filepath.Join(DevInputPath, e.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove %s: %w", e.Name(), err)
+		}
+		removed++
+	}
+	klog.InfoS("Sanitized pod-private /dev/input", "removed", removed)
 	return nil
 }
 
