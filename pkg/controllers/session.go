@@ -3,9 +3,7 @@ package controllers
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"fmt"
-	"net/http"
 	"os"
 	"reflect"
 	"sync"
@@ -1735,8 +1733,10 @@ func (c *SessionController) reconcileActiveStreams(
 		return fmt.Errorf("failed to get deployment: %s", err)
 	}
 
-	if deployment.Status.ObservedGeneration != deployment.Generation ||
-		deployment.Status.ReadyReplicas != deployment.Status.Replicas {
+	// Gate on a ready pod, not just matching counters: a fresh deployment
+	// briefly reports 0/0, and dialing the Service then can hang on a ClusterIP
+	// the CNI has not programmed yet.
+	if !util.DeploymentReady(deployment) {
 		return fmt.Errorf("deployment %s/%s not ready (Observed %d, Latest %d) (%d/%d)", session.Namespace, deploymentName, deployment.Status.ObservedGeneration, deployment.Generation, deployment.Status.ReadyReplicas, deployment.Status.Replicas)
 	}
 
@@ -1752,11 +1752,12 @@ func (c *SessionController) reconcileActiveStreams(
 	// but that is hardcoded for now :)
 	// Dial the wolf-agent through this session's Service, on the per-session
 	// external agent port (it forwards to the agent's fixed in-pod 8443).
-	wolfclient := wolfapi.NewClient(fmt.Sprintf("https://%s:%d", service.Spec.ClusterIP, session.Status.Ports.Agent), &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-	})
+	// Bounded timeouts: a hung connect must not block this worker past the
+	// 1-minute dead-session reaper; the error requeues the session instead.
+	wolfclient := wolfapi.NewClient(
+		fmt.Sprintf("https://%s:%d", service.Spec.ClusterIP, session.Status.Ports.Agent),
+		wolfapi.NewHTTPClient(wolfapi.DefaultDialTimeout, wolfapi.DefaultRequestTimeout),
+	)
 	sessions, err := wolfclient.ListSessions(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to list sessions: %s", err)
