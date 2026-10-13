@@ -46,6 +46,12 @@ type ClientSettings struct {
 	RunGID              int     `json:"run_gid"`
 	RunUID              int     `json:"run_uid"`
 	VScrollAcceleration float64 `json:"v_scroll_acceleration"`
+	// Wolf parses client_settings strictly: once the object is present every
+	// field of its ClientSettings struct is required. Upstream wolf PR #442
+	// added motion_controller_override, so omitting it makes
+	// /api/v1/sessions/add fail with "Field named 'motion_controller_override'
+	// not found". "AUTO" is wolf's own default.
+	MotionControllerOverride string `json:"motion_controller_override"`
 }
 type Client interface {
 	AddSession(ctx context.Context, session Session) (string, error)

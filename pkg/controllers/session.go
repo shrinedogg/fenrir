@@ -1888,12 +1888,13 @@ func (c *SessionController) reconcileActiveStreams(
 			//If this isn't present it crashes
 			//so, I'll keep it here until I figure out a way to pass off from moonlight client
 			ClientSettings: wolfapi.ClientSettings{
-				RunGID:              1000,
-				RunUID:              1000,
-				ControllersOverride: []string{"XBOX"},
-				MouseAcceleration:   1.0,
-				VScrollAcceleration: 1.0,
-				HScrollAcceleration: 1.0,
+				RunGID:                   1000,
+				RunUID:                   1000,
+				ControllersOverride:      []string{"XBOX"},
+				MouseAcceleration:        1.0,
+				VScrollAcceleration:      1.0,
+				HScrollAcceleration:      1.0,
+				MotionControllerOverride: "AUTO",
 			},
 			AESKey: session.Spec.Config.AESKey,
 			AESIV:  session.Spec.Config.AESIV,
