@@ -221,7 +221,10 @@ func (s *RESTServer) serverInfoHandler(w http.ResponseWriter, r *http.Request) {
 			GfeVersion:             "3.23.0.74",
 			UniqueID:               "dd7c60f6-4b88-4ef1-be07-eeec72f96080", // Does this matter?
 			MaxLumaPixelsHEVC:      1869449984,
-			ServerCodecModeSupport: 65793, // Bitwise OR of various codecs. Just hardcoding HEVC and AV1 for now
+			// Advertise H.264 + HEVC Main/Main10 + AV1 Main8 (0x1 | 0x100 | 0x200 | 0x10000).
+			// HEVC Main10 is required for Moonlight clients to negotiate HDR; wolf gates
+			// actual 10-bit encoding on WOLF_ENABLE_HDR at session time.
+			ServerCodecModeSupport: 66305,
 			HttpsPort:              s.SecurePort,
 			ExternalPort:           s.Port,
 			MAC:                    "00:00:00:00:00:00", // Does this matter?
