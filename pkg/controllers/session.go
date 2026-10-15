@@ -921,6 +921,22 @@ func (c *SessionController) reconcilePod(ctx context.Context, session *v1alpha1t
 			},
 		)
 
+		// If the App CR pins NVIDIA_VISIBLE_DEVICES (e.g. per-GPU isolation),
+		// drop it here so the operator's "all" below doesn't become a duplicate
+		// env key (SSA rejects duplicates and the Deployment is never created);
+		// the pinned value is re-appended after.
+		var pinnedVisibleDevices *corev1.EnvVar
+		keptEnv := podToCreate.Spec.Containers[i].Env[:0]
+		for _, e := range podToCreate.Spec.Containers[i].Env {
+			if e.Name == "NVIDIA_VISIBLE_DEVICES" {
+				v := e
+				pinnedVisibleDevices = &v
+				continue
+			}
+			keptEnv = append(keptEnv, e)
+		}
+		podToCreate.Spec.Containers[i].Env = keptEnv
+
 		podToCreate.Spec.Containers[i].Env = append(podToCreate.Spec.Containers[i].Env, []corev1.EnvVar{
 			// Standard GOW envars
 			{Name: "DISPLAY", Value: ":0"},
@@ -950,6 +966,16 @@ func (c *SessionController) reconcilePod(ctx context.Context, session *v1alpha1t
 			{Name: "GAMESCOPE_HEIGHT", Value: fmt.Sprint(session.Spec.Config.VideoHeight)},
 			{Name: "GAMESCOPE_REFRESH", Value: fmt.Sprint(session.Spec.Config.VideoRefreshRate)},
 		}...)
+
+		// If the App CR pinned the device list, overwrite the operator's "all"
+		// entry in place (single env key, no SSA duplicate).
+		if pinnedVisibleDevices != nil {
+			for j, e := range podToCreate.Spec.Containers[i].Env {
+				if e.Name == "NVIDIA_VISIBLE_DEVICES" {
+					podToCreate.Spec.Containers[i].Env[j] = *pinnedVisibleDevices
+				}
+			}
+		}
 
 		// Validate the main app container's resources against the user's policy.
 		validatedResources, err := validateAppResources(podToCreate.Spec.Containers[i].Resources, user.Spec.Resources)
