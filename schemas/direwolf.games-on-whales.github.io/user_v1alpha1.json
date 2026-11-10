@@ -14,6 +14,15 @@
     },
     "spec": {
       "properties": {
+        "gpuVendor": {
+          "default": "nvidia",
+          "description": "GPUVendor selects the GPU-specific environment the operator injects\ninto the app containers. \"nvidia\" (the default) injects the NVIDIA\ncontainer-runtime and VA-API-on-NVIDIA variables. \"amd\" injects none\nof them, so Mesa (radeonsi/RADV) and libva select the driver from the\nrender node themselves; forcing LIBVA_DRIVER_NAME=nvidia on an AMD\ncard breaks VA-API.",
+          "enum": [
+            "nvidia",
+            "amd"
+          ],
+          "type": "string"
+        },
         "resources": {
           "description": "Resources defines the maximum resource requests and limits that the app\ncontainer can have. If an app requests exceeds these values,\nthe app will fail to start.",
           "properties": {
