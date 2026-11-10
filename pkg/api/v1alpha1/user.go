@@ -34,7 +34,24 @@ type UserSpec struct {
 	// operator will use its own built-in default values.
 	// +optional
 	SidecarPolicies *SidecarPolicies `json:"sidecarPolicies,omitempty"`
+	// GPUVendor selects the GPU-specific environment the operator injects
+	// into the app containers. "nvidia" (the default) injects the NVIDIA
+	// container-runtime and VA-API-on-NVIDIA variables. "amd" injects none
+	// of them, so Mesa (radeonsi/RADV) and libva select the driver from the
+	// render node themselves; forcing LIBVA_DRIVER_NAME=nvidia on an AMD
+	// card breaks VA-API.
+	// +optional
+	// +kubebuilder:validation:Enum=nvidia;amd
+	// +kubebuilder:default=nvidia
+	GPUVendor string `json:"gpuVendor,omitempty"`
 }
+
+// GPU vendors accepted by UserSpec.GPUVendor.
+const (
+	GPUVendorNVIDIA = "nvidia"
+	GPUVendorAMD    = "amd"
+)
+
 //TODO
 // This will also need rework
 // Since I forgot that we might actually need to inject more than

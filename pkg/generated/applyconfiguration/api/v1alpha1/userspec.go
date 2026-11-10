@@ -28,6 +28,7 @@ type UserSpecApplyConfiguration struct {
 	Resources       *v1.ResourceRequirements           `json:"resources,omitempty"`
 	Volumes         []v1.Volume                        `json:"volumes,omitempty"`
 	SidecarPolicies *SidecarPoliciesApplyConfiguration `json:"sidecarPolicies,omitempty"`
+	GPUVendor       *string                            `json:"gpuVendor,omitempty"`
 }
 
 // UserSpecApplyConfiguration constructs a declarative configuration of the UserSpec type for use with
@@ -59,5 +60,13 @@ func (b *UserSpecApplyConfiguration) WithVolumes(values ...v1.Volume) *UserSpecA
 // If called multiple times, the SidecarPolicies field is set to the value of the last call.
 func (b *UserSpecApplyConfiguration) WithSidecarPolicies(value *SidecarPoliciesApplyConfiguration) *UserSpecApplyConfiguration {
 	b.SidecarPolicies = value
+	return b
+}
+
+// WithGPUVendor sets the GPUVendor field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the GPUVendor field is set to the value of the last call.
+func (b *UserSpecApplyConfiguration) WithGPUVendor(value string) *UserSpecApplyConfiguration {
+	b.GPUVendor = &value
 	return b
 }
